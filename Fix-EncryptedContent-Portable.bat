@@ -1,4 +1,4 @@
-# 2>nul & @echo off & title Fix-EncryptedContent - rescue opencode sessions & where py >nul 2>nul & if errorlevel 1 (python "%~f0" %*) else (py -3 "%~f0" %*) & echo. & pause
+# 2>nul & @echo off & title Fix-EncryptedContent - rescue opencode sessions & where py >nul 2>nul & if errorlevel 1 (python "%~f0" %*) else (py -3 "%~f0" %*) & echo. & pause & exit /b
 #!/usr/bin/env python3
 """
 Fix-EncryptedContent v3 single-file: rescue opencode AND modified-opencode
@@ -11,14 +11,14 @@ Error fixed:
   Error from provider (Console): Upstream request failed: [invalid_request_error]
   reasoning `encrypted_content` was not issued to this caller
 
-Menu on double-click (no arguments needed):
-  [1] Stock opencode
-  [2] Modified opencode / other command  (you type its command name)
-  [3] A data folder directly             (you paste the folder path)
+Menu on double-click (no arguments needed) - two options:
+  [1] opencode sessions  (STABLE - proven fix)
+  [2] Bosun workers      (UNSTABLE - early development)
 
 Direct use:
-  Fix-EncryptedContent-Standalone.bat --bin victor
-  Fix-EncryptedContent-Standalone.bat --dir "D:\\path\\to\\data-dir"
+  Fix-EncryptedContent-Portable.bat --bosun
+  Fix-EncryptedContent-Portable.bat --bin victor
+  Fix-EncryptedContent-Portable.bat --dir "D:\\path\\to\\data-dir"
 
 Safety: timestamped backup of DB + storage first. Nothing deleted. Stdlib only.
 Quit the target app (TUI + workers) before running.
@@ -34,7 +34,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-APP = "Fix-EncryptedContent v3 single-file"
+APP = "Fix-EncryptedContent v4 session-locator"
 
 # Key names carrying caller-bound secrets. Removed ONLY inside reasoning/thinking
 # carriers or metadata subtrees - never part/message linkage, never tool data.
@@ -85,9 +85,12 @@ def pause_exit():
 
 
 def run_quiet(cmd, timeout=20):
+    # NOTE: decode with errors="replace" - some CLIs (e.g. `bosun`, a .CMD
+    # shim) emit non-UTF8 bytes on stdout, which used to crash the reader
+    # thread with UnicodeDecodeError instead of just yielding no output.
     try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout).stdout.strip()
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+        return proc.stdout.decode("utf-8", errors="replace").strip()
     except Exception:
         return ""
 
@@ -158,6 +161,143 @@ def true_data_dir(bin_name="opencode", forced_dir=None):
             log("  Found DB by search: %s" % os.path.join(d, "opencode.db"))
             return d, "search"
     return None, "none"
+
+
+def session_store_roots(extra_dir=None):
+    """Everywhere local session content may live (for byte-level search)."""
+    roots = []
+    for d in candidate_data_dirs():
+        if os.path.isdir(d):
+            roots.append(d)
+    appdata = os.environ.get("APPDATA", "")
+    desk = os.path.join(appdata, "ai.opencode.desktop") if appdata else ""
+    if desk and os.path.isdir(desk):
+        roots.append(desk)
+    code = os.path.join(appdata, "Code", "User") if appdata else ""
+    for sub in ("workspaceStorage", "globalStorage"):
+        p = os.path.join(code, sub)
+        if code and os.path.isdir(p):
+            roots.append(p)
+    if extra_dir:
+        extra_dir = os.path.normpath(os.path.expandvars(os.path.expanduser(extra_dir.strip('" '))))
+        if os.path.isdir(extra_dir) and extra_dir not in roots:
+            roots.append(extra_dir)
+    return roots
+
+
+def iter_session_files(roots):
+    """Yield bounded candidate files: .db*, .dat, .vscdb, session json(l)."""
+    seen = set()
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            low = os.path.basename(dirpath).lower()
+            if low in ("cache", "cacheddata", "gpu-cache", "dawncache",
+                       "blob_storage", "node_modules", "logs", "crashpad"):
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d.lower() != "node_modules"]
+            for name in filenames:
+                ln = name.lower()
+                keep = (ln.startswith("opencode.db") or ln.endswith(".dat")
+                        or ln.endswith(".vscdb")
+                        or (ln.endswith(".json") and ("ses_" in ln or "session" in ln))
+                        or ln.endswith(".jsonl"))
+                if not keep:
+                    continue
+                p = os.path.join(dirpath, name)
+                if p in seen:
+                    continue
+                seen.add(p)
+                try:
+                    if os.path.getsize(p) > 300 * 1024 * 1024:
+                        continue
+                except Exception:
+                    continue
+                yield p
+
+
+def locate_session(ses_id, roots):
+    """Byte-level search for a session id across candidate stores."""
+    needle = ses_id.encode("utf-8", errors="replace")
+    found, scanned = [], 0
+    for path in iter_session_files(roots):
+        scanned += 1
+        try:
+            with open(path, "rb") as fh:
+                tail = b""
+                while True:
+                    chunk = fh.read(1 << 20)
+                    if not chunk:
+                        break
+                    if needle in tail + chunk:
+                        found.append(path)
+                        break
+                    tail = (tail + chunk)[-256:]
+        except Exception:
+            continue
+    return found, scanned
+
+
+def backup_db_file(db_path, ts):
+    """Back up one database file (+ WAL/SHM sidecars) to a sibling folder."""
+    dest = db_path + "-rescue-backup-" + ts
+    os.makedirs(dest, exist_ok=True)
+    copied = []
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        src = db_path + suffix
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(dest, os.path.basename(src)))
+            copied.append(os.path.basename(src))
+    return dest, copied
+
+
+def locate_and_fix(ses_id, extra_dir=None):
+    """Find which local store owns a session id, then sanitize that store."""
+    if not ses_id:
+        log("  No session id given - nothing to do.")
+        return 1
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    roots = session_store_roots(extra_dir)
+    log("  Searching %d store location(s) for %s ..." % (len(roots), ses_id))
+    for r in roots:
+        log("    - %s" % r)
+    found, scanned = locate_session(ses_id, roots)
+    log("  Scanned %d file(s)." % scanned)
+    if not found:
+        log("  NOT FOUND in any local store. The session may live server-side")
+        log("  (synced/cloud session) - paste this log to your assistant.")
+        return 1
+    log("  Session lives in:")
+    for f in found:
+        log("    - %s" % f)
+    log("")
+    for f in found:
+        fl = f.lower()
+        if fl.endswith(".db") or fl.endswith(".vscdb"):
+            dest, copied = backup_db_file(f, ts)
+            log("  Backup -> %s (%s)" % (dest, ", ".join(copied)))
+            try:
+                st = sanitize_db(f)
+            except sqlite3.OperationalError as exc:
+                log("  [ERROR] database is locked (%s). Close the app, re-run." % exc)
+                return 1
+            log("  rows updated: %d, carriers fixed: %d" % (
+                st["rows_updated"], st["carriers_scrubbed"]))
+            if st["residue"]:
+                log("  LEFTOVER keys (paste to your assistant):")
+                for r in st["residue"][:20]:
+                    log("    - %s" % r)
+            if st["rows_updated"] == 0 and not st["residue"]:
+                log("  (no poison shapes in this store - history here is clean)")
+        elif fl.endswith(".json") or fl.endswith(".jsonl"):
+            dest, copied = backup_db_file(f, ts)
+            log("  Backup -> %s" % dest)
+            res = scrub_json_file(f)
+            log("  file fixed: %s" % bool(isinstance(res, tuple) and res[0]))
+        else:
+            log("  %s : binary app-internal format - cannot safely edit." % f)
+            log("  Paste this path to your assistant for the manual step.")
+    return 0
 
 
 def target_running(exe_names):
@@ -463,21 +603,31 @@ def sanitize_file_stores(datadir):
 
 
 def ask_menu():
-    print("  Which install should be repaired?")
-    print("    [1] Stock opencode  (default)")
-    print("    [2] Modified opencode / other command")
-    print("    [3] A data folder directly")
+    print("  What are we fixing today?")
+    print("    [1] opencode sessions  (STABLE - proven fix)")
+    print("    [2] Bosun workers      (UNSTABLE - early development)")
     try:
-        choice = input("  Choice [1/2/3, Enter=1]: ").strip() or "1"
+        choice = input("  Choice [1/2, Enter=1]: ").strip() or "1"
     except (EOFError, KeyboardInterrupt):
         return ("opencode", None)
     if choice == "2":
+        return ("__bosun__", None)
+    print("")
+    print("  opencode target:")
+    print("    [1] Stock opencode store  (default)")
+    print("    [2] A data folder directly")
+    print("    [3] Find where a session lives (still fails after cleaning)")
+    try:
+        sub = input("  Choice [1/2/3, Enter=1]: ").strip() or "1"
+    except (EOFError, KeyboardInterrupt):
+        return ("opencode", None)
+    if sub == "3":
         try:
-            name = input("  Command name (e.g. victor): ").strip() or "opencode"
+            sid = input("  Session id (e.g. ses_...): ").strip()
         except (EOFError, KeyboardInterrupt):
-            name = "opencode"
-        return (name, None)
-    if choice == "3":
+            sid = ""
+        return ("__locate__", sid or None)
+    if sub == "2":
         try:
             folder = input("  Data folder path: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -486,17 +636,92 @@ def ask_menu():
     return ("opencode", None)
 
 
+def bosun_flow():
+    """Option 2: Bosun worker path. Status: UNSTABLE / early development.
+
+    Workers spawn fresh `opencode run` sessions on every delegation and inherit
+    the Captain's environment (no data-root redirect - verified in
+    bosun/worker/run-worker.ts), so they share the stock session store and
+    usually have nothing stored to scrub. This flow cleans the shared store,
+    then hands over the 2-minute verification that actually decides the case.
+    """
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    log("=" * 70)
+    log("  OPTION 2: Bosun workers  (UNSTABLE - early development)")
+    log("=" * 70)
+    log("  Workers share the stock opencode session store, and fresh worker")
+    log("  runs have no stored history - so scrubbing rarely applies to them.")
+    log("  The verification at the end is the real test.")
+    log("")
+    running = target_running(["opencode", "bosun"])
+    if running:
+        log("  [!] Running: %s - close TUI/workers first (DB may lock)." % ", ".join(running))
+        try:
+            input("      Press ENTER once closed (Ctrl+C to abort)... ")
+        except KeyboardInterrupt:
+            log("Aborted - nothing was changed.")
+            return 1
+        log("")
+    datadir, how = true_data_dir("opencode")
+    if not datadir:
+        log("  [ERROR] shared store not found - nothing to scrub.")
+    else:
+        log("  Shared store (%s): %s" % (how, datadir))
+        dest, copied = backup_data_dir(datadir, ts)
+        log("  Backup -> %s" % dest)
+        db_path = os.path.join(datadir, "opencode.db")
+        if os.path.isfile(db_path):
+            try:
+                st = sanitize_db(db_path)
+            except sqlite3.OperationalError as exc:
+                log("  [ERROR] database is locked (%s). Close apps, re-run." % exc)
+                return 1
+            log("  rows updated: %d, carriers fixed: %d" % (
+                st["rows_updated"], st["carriers_scrubbed"]))
+        fst = sanitize_file_stores(datadir)
+        log("  files updated: %d" % fst["files_updated"])
+    log("")
+    log("  VERIFY (2 minutes, decides the case):")
+    log("    1. Re-delegate ONE trivial task (e.g. append a marker line in a")
+    log("       disposable workspace, then re-read it).")
+    log("    2. GREEN -> incident over for workers. Nothing more to do.")
+    log("    3. RED with the same encrypted_content error -> rotation is still")
+    log("       happening mid-run. Paste the worker stderr; the fallback is a")
+    log("       non-thinking worker model (nothing signable, nothing to stale).")
+    log("  NOTE: failed attempts are one-shot runs - just re-delegate; their")
+    log("  transcripts under .bosun/delegations were never touched.")
+    return 0
+
+
 def main():
-    ap = argparse.ArgumentParser(prog="Fix-EncryptedContent-Standalone.bat")
+    ap = argparse.ArgumentParser(prog="Fix-EncryptedContent-Portable.bat")
     ap.add_argument("--bin", default=None,
                     help="CLI command of the install to repair")
     ap.add_argument("--dir", default=None,
                     help="Data directory to repair directly")
+    ap.add_argument("--find-session", default=None,
+                    help="Locate which local store owns a session id, then fix it")
+    ap.add_argument("--bosun", action="store_true",
+                    help="Bosun worker path (UNSTABLE - early development)")
     ap.add_argument("--no-pause", action="store_true",
                     help="Do not wait for ENTER at the end (terminal use)")
     args = ap.parse_args()
 
     no_pause = args.no_pause
+    if args.find_session:
+        code = locate_and_fix(args.find_session, args.dir)
+        if not no_pause:
+            pause_exit()
+        try:
+            log_path = os.path.join(os.path.expanduser("~"), "Desktop",
+                                    "Fix-EncryptedContent-LOG-%s.txt"
+                                    % datetime.now().strftime("%Y%m%d-%H%M%S"))
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(LOG_LINES))
+            print("\n  Log saved: %s" % log_path)
+        except Exception:
+            pass
+        return code
     if args.bin is None and args.dir is None:
         if sys.stdin.isatty():
             args.bin, args.dir = ask_menu()
@@ -504,6 +729,26 @@ def main():
                 args.bin = "opencode"
         else:
             args.bin = "opencode"
+    if args.bin == "__locate__":
+        code = locate_and_fix(args.dir)
+        if not no_pause:
+            pause_exit()
+        return code
+    if args.bosun or args.bin == "__bosun__":
+        code = bosun_flow()
+        try:
+            log_path = os.path.join(os.path.expanduser("~"), "Desktop",
+                                    "Fix-EncryptedContent-LOG-%s.txt"
+                                    % datetime.now().strftime("%Y%m%d-%H%M%S"))
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write("\n".join(LOG_LINES))
+            print("")
+            print("  Log saved: %s" % log_path)
+        except Exception:
+            pass
+        if not no_pause:
+            pause_exit()
+        return code
     if args.bin is None:
         args.bin = "opencode"
 
