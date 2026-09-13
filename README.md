@@ -49,7 +49,7 @@ Python standard library only — nothing to install.
 Terminal use:
 
 ```bat
-Fix-EncryptedContent-Standalone.bat --bin victor --no-pause
-Fix-EncryptedContent-Standalone.bat --dir "D:\path\to\data-dir"
+Fix-EncryptedContent-Portable.bat --bin victor --no-pause
+Fix-EncryptedContent-Portable.bat --dir "D:\path\to\data-dir"
 Repeat once per install — stock and forks keep separate stores. A run log
 (Fix-EncryptedContent-LOG-*.txt) lands on your Desktop.
